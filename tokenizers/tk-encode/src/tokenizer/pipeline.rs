@@ -374,6 +374,10 @@ impl PipelineTokenizer {
     pub const STAGE_SPLIT: u8 = 2;
     pub const STAGE_MODEL: u8 = 3;
 
+    pub fn get_model(&self) -> &PipelineModel {
+        &self.model
+    }
+
     /// Encode `input` into token ids.
     ///
     /// Special tokens are matched in two passes:
@@ -731,6 +735,7 @@ impl Model for PipelineModel {
             (Self::WordPiece(model), PipelineModelScratch::WordPiece(scratch)) => {
                 model.tokenize_pipeline(sequence, scratch, output)
             }
+            _ => unreachable!()
         }
     }
 
