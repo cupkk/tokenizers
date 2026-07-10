@@ -735,7 +735,7 @@ impl Model for PipelineModel {
             (Self::WordPiece(model), PipelineModelScratch::WordPiece(scratch)) => {
                 model.tokenize_pipeline(sequence, scratch, output)
             }
-            _ => unreachable!()
+            _ => unreachable!(),
         }
     }
 
