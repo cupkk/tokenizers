@@ -61,6 +61,7 @@ ptr_hash = { version = "1.1.0" }
 memchr = "2.8.2"
 unicode-normalization = "0.1.25"
 yada = "0.7.0"
+
 # Latest released tokenizers, used as the comparison baseline by the CI benchmark
 # (examples gated on `bench-baseline`). Optional so production builds never pull it.
 tokenizers-release = { package = "tokenizers", version = "=0.23.1", optional = true }
