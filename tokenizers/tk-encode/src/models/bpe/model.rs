@@ -1,4 +1,5 @@
 use super::{super::OrderedVocabIter, Error, Pair, Word};
+use crate::bucket_vocab_store::BucketVocabStore;
 use crate::models::bpe::Merge;
 use crate::pipeline::{self, ModelScratch, PipelineToken};
 use crate::tokenizer::{Model, Result, Token};
@@ -680,7 +681,7 @@ impl Model for BPE {
 
 pub struct PipelineBPE {
     atoms: Atoms,
-    vocab: VocabStore,
+    vocab: BucketVocabStore,
     merges: MergeMap,
     ignore_merges: bool,
 }
@@ -718,7 +719,8 @@ impl PipelineBPE {
         } = model;
 
         let (vocab, atoms) = if with_byte_level {
-            let vocab = byte_level::transform_vocab(vocab);
+            let mut vocab = BucketVocabStore::build(vocab.byte_content());
+            vocab = byte_level::transform_vocab(vocab);
             let mut byte_to_id = [0u32; 256];
             for b in 0u8..=255 {
                 byte_to_id[b as usize] = vocab
@@ -727,6 +729,7 @@ impl PipelineBPE {
             }
             (vocab, Atoms::Bytes { byte_to_id })
         } else {
+            let vocab = BucketVocabStore::build(vocab.byte_content());
             let unk_token = if let Some(unk_str) = unk_token {
                 let token_id = vocab
                     .token_to_id(&unk_str)
