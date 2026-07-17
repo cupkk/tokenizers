@@ -9,11 +9,16 @@ tk-encode/bench-baseline --example fixture_bench`:
      models: [{model, shape, desc, [reason],
                memory: {baseline|pipeline:
                         {load_bytes, encode_bytes, peak_bytes} | null} | null,
+               threads: {counts: [1,2,4,8,max],
+                         pipeline_mbps: [..], baseline_mbps: [..|null]},
                results: [{fixture, group, bytes, chunks,
                           mbps: {baseline, pipeline},
                           ids_match, ids_match_baseline,
                           stage_ns_per_byte: {added_split, normalize,
-                                              pre_tokenize, model, total}}]}]}
+                                              pre_tokenize, model, total},
+                          pretok_vs_regex: {cls_simd, cls_scalar,
+                                            onig|null, fancy|null,
+                                            pcre2|null, logos|null}}]}]}
 
 Two series: `baseline` — the latest released tokenizers crate, the bar to beat
 (the in-tree Tokenizer is on its way out, so it isn't benched; it only serves
@@ -31,7 +36,8 @@ always-visible charts:
      measurement, via --binary-sizes).
 
 Everything else is collapsed into per-model <details> blocks: a per-fixture
-×speedup chart, the pipeline stage decomposition (100%-normalized per fixture —
+×speedup chart, a thread-scaling chart (encode throughput at 1/2/4/8/device-max
+threads, pipeline vs the release), the pipeline stage decomposition (100%-normalized per fixture —
 each stage as its share of that fixture's own encode time, labelled `share% ·
 ns/B`, so the mix reads regardless of how slow the release baseline is; total
 ns/B and ×speedup stay in the right column), and the numbers table (which carries
@@ -138,10 +144,24 @@ def model_speedups(model):
     return [v for v in (speedup(r) for r in model["results"]) if v]
 
 
-def scale(models):
+def base_speedup(row, base_lookup, model_name):
+    """This PR's pipeline throughput ÷ the base branch's pipeline throughput for the
+    same (model, fixture) — the "did this PR help vs the base branch" ratio. `None`
+    when the base branch didn't bench that fixture (added model, renamed fixture …)."""
+    p = row["mbps"].get("pipeline")
+    b = base_lookup.get((model_name, row["fixture"]))
+    return p / b if b and p else None
+
+
+def base_model_speedups(model, base_lookup):
+    return [v for v in (base_speedup(r, base_lookup, model["model"])
+                        for r in model["results"]) if v]
+
+
+def scale(models, speedups_of=model_speedups):
     """Shared log2 x-range across every plotted speedup, so charts for
     different models are directly comparable."""
-    vals = [v for m in models for v in model_speedups(m)]
+    vals = [v for m in models for v in speedups_of(m)]
     if not vals:
         return 0.75, 1.5
     return min(0.75, min(vals) / 1.08), max(1.5, max(vals) * 1.08)
@@ -220,13 +240,21 @@ def speedup_axis(ink, x, ticks, top, bottom):
     return "".join(grid) + hints
 
 
-def overview_svg(models, mode, subtitle_base, meta, lo, hi, baseline_label):
+def overview_svg(models, mode, subtitle_base, meta, lo, hi, baseline_label,
+                 speedups_of=model_speedups, title=None, ref_label=None,
+                 mark_regressions=False, no_cmp_msg=None):
     """The headline chart: a row per manifest model — name + workload desc,
-    geomean ×speedup of the pipeline vs the release (×1.0) with a min–max
+    geomean ×speedup of the pipeline vs the reference (×1.0) with a min–max
     whisker across fixtures. No cross-model aggregate on purpose: the models
     exercise different execution modes. Unsupported models appear as muted
-    status rows so the overview is the complete state of the world."""
+    status rows so the overview is the complete state of the world.
+
+    Defaults draw "vs latest release". Pass `speedups_of=base_model_speedups`-style
+    with `mark_regressions=True` for the "vs base branch" twin: bars for models that
+    got slower than the base branch turn red."""
     ink, sink = INK[mode], SERIES_INK[mode]
+    title = title or "PipelineTokenizer vs latest release — encode throughput"
+    ref_label = ref_label or baseline_label
 
     def x(v):
         return OV_GUTTER + (math.log2(v) - math.log2(lo)) / (math.log2(hi) - math.log2(lo)) * OV_PLOT
@@ -245,10 +273,11 @@ def overview_svg(models, mode, subtitle_base, meta, lo, hi, baseline_label):
         desc = m.get("desc") or m["shape"]
         body.append(f'<text x="{OV_GUTTER - 14}" y="{cy + 11:.1f}" fill="{ink["muted"]}" '
                     f'font-size="10.5" text-anchor="end">{escape(desc)}</text>')
-        vals = model_speedups(m)
+        vals = speedups_of(m)
         if vals:
             g, mn, mx = geomean(vals), min(vals), max(vals)
-            body.append(hbar(x(1.0), x(g), cy - 7, 14, sink["pipeline"]))
+            bar_color = ink["critical"] if (mark_regressions and g < 1) else sink["pipeline"]
+            body.append(hbar(x(1.0), x(g), cy - 7, 14, bar_color))
             body.append(f'<line x1="{x(mn):.1f}" y1="{cy:.1f}" x2="{x(mx):.1f}" y2="{cy:.1f}" '
                         f'stroke="{ink["secondary"]}" stroke-width="1.5"/>')
             for v in (mn, mx):
@@ -267,9 +296,9 @@ def overview_svg(models, mode, subtitle_base, meta, lo, hi, baseline_label):
             body.append(f'<text x="{col_x}" y="{cy + 4:.1f}" fill="{fill}" font-size="12" '
                         f'text-anchor="end" style="font-variant-numeric:tabular-nums">{right}</text>')
         elif m["results"]:
+            msg = no_cmp_msg or f"benched, but {baseline_label} can’t load this model — no comparison"
             body.append(f'<text x="{x(1.0) + 8:.1f}" y="{cy + 4:.1f}" fill="{ink["muted"]}" '
-                        f'font-size="11.5" font-style="italic">benched, but {escape(baseline_label)} '
-                        f'can’t load this model — no comparison</text>')
+                        f'font-size="11.5" font-style="italic">{escape(msg)}</text>')
         else:
             pretok = m["shape"].split("·")[-1].strip()
             why = (m.get("reason") or f"no {pretok} pre-tokenizer")
@@ -283,13 +312,12 @@ def overview_svg(models, mode, subtitle_base, meta, lo, hi, baseline_label):
     y += 30
     legend = legend_row(ink, sink, y, [
         ("swatch", "pipeline", "PipelineTokenizer"),
-        ("tick", ink["baseline"], f"×1.0 = {baseline_label}"),
+        ("tick", ink["baseline"], f"×1.0 = {ref_label}"),
     ])
     height = y + 34
-    subtitle = (f"geomean ×speedup per model vs {baseline_label} · "
+    subtitle = (f"geomean ×speedup per model vs {ref_label} · "
                 f"whisker: min–max across fixtures · {subtitle_base}")
-    return svg_doc(ink, height, "PipelineTokenizer vs latest release — encode throughput",
-                   subtitle, axis + "".join(body) + legend, meta)
+    return svg_doc(ink, height, title, subtitle, axis + "".join(body) + legend, meta)
 
 
 def memory_svg(models, mode, meta, baseline_label):
@@ -680,7 +708,128 @@ def binsize_svg(sizes, mode, meta, baseline_label):
                    subtitle, "".join(grid) + "".join(body), meta)
 
 
-def render_markdown(data, subtitle_base, meta, base, run_id, sizes):
+def has_threads(m):
+    t = m.get("threads")
+    return isinstance(t, dict) and bool(t.get("counts"))
+
+
+def threads_svg(model, mode, meta, baseline_label):
+    """Per model: encode throughput (MB/s) at 1/2/4/8/device-max threads — pipeline vs the release —
+    with a per-row *ideal linear* tick (single-thread throughput × N) on the pipeline bar. So whether the
+    pipeline scales linearly (bar reaches the tick) or sub-linearly (bar falls short of it) is visible at a
+    glance, alongside the pipeline↔release gap; the right column carries the self-scaling % of linear."""
+    ink, sink = INK[mode], SERIES_INK[mode]
+    t = model["threads"]
+    counts, pipe, base = t["counts"], t["pipeline_mbps"], t["baseline_mbps"]
+    p1 = pipe[0] if pipe and pipe[0] else None  # single-thread anchor for the linear reference
+    ideal = [p1 * n for n in counts] if p1 else []
+    vals = [v for v in pipe if v] + [v for v in base if v] + ideal
+    max_mb = (max(vals) if vals else 1.0) * 1.08
+    plot_w = CHART_W - OV_GUTTER - PAD_R - COL_W
+
+    def x(v):
+        return OV_GUTTER + v / max_mb * plot_w
+
+    top, bar_h, gap = 78, 11, 3
+    row_h = 2 * (bar_h + gap) + 16
+    col_x = CHART_W - 16
+    body = [f'<text x="{col_x}" y="{top - 14}" fill="{ink["muted"]}" font-size="11" '
+            f'text-anchor="end">Pipeline MB/s · self-scaling (% of linear)</text>',
+            f'<text x="{OV_GUTTER}" y="{top - 14}" fill="{ink["muted"]}" font-size="11">'
+            f'higher is better · top bar {escape(baseline_label)}, bottom Pipeline · tick = ideal linear</text>']
+    y = top
+    for i, n in enumerate(counts):
+        cy = y + row_h / 2
+        label = f"{n} thread" + ("" if n == 1 else "s")
+        body.append(f'<text x="{OV_GUTTER - 14}" y="{cy + 4:.1f}" fill="{ink["primary"]}" '
+                    f'font-size="12.5" font-weight="600" text-anchor="end">{label}</text>')
+        base_y, pipe_y = y + 8, y + 8 + bar_h + gap
+        b = base[i] if i < len(base) else None
+        if b is not None:
+            body.append(hbar(x(0), x(b), base_y, bar_h, sink["baseline"]))
+        p = pipe[i] if i < len(pipe) else None
+        if p is not None:
+            body.append(hbar(x(0), x(p), pipe_y, bar_h, sink["pipeline"]))
+        # Ideal-linear reference for the pipeline (single-thread × N): the bar reaching this tick == linear.
+        if p1 is not None and n > 1:
+            ix = x(p1 * n)
+            body.append(f'<line x1="{ix:.1f}" y1="{pipe_y - 2:.1f}" x2="{ix:.1f}" '
+                        f'y2="{pipe_y + bar_h + 2:.1f}" stroke="{ink["primary"]}" stroke-width="1.5"/>')
+        if p is not None and p1:
+            sc = p / p1
+            right = f"{p:.0f} · {sc:.1f}× ({sc / n * 100:.0f}%)"
+        else:
+            right = f"{p:.0f}" if p is not None else "—"
+        body.append(f'<text x="{col_x}" y="{cy + 4:.1f}" fill="{ink["secondary"]}" font-size="12" '
+                    f'text-anchor="end" style="font-variant-numeric:tabular-nums">{right}</text>')
+        y += row_h
+
+    grid = []
+    ticks = nice_ticks(max_mb)
+    for tv in ticks:
+        unit = " MB/s" if tv == ticks[-1] else ""
+        gx = x(tv)
+        grid.append(f'<line x1="{gx:.1f}" y1="{top - 6}" x2="{gx:.1f}" y2="{y - 4}" '
+                    f'stroke="{ink["grid"]}" stroke-width="1"/>')
+        grid.append(f'<text x="{gx:.1f}" y="{y + 10}" fill="{ink["muted"]}" font-size="11" '
+                    f'text-anchor="middle" style="font-variant-numeric:tabular-nums">{tv:g}{unit}</text>')
+    y += 30
+    legend = legend_row(ink, sink, y, [
+        ("swatch", "baseline", baseline_label),
+        ("swatch", "pipeline", "PipelineTokenizer"),
+        ("tick", ink["primary"], "ideal linear (T₁ × N)"),
+    ])
+    height = y + 34
+    scaling = ""
+    if p1 and len(pipe) >= 2 and pipe[-1]:
+        sc = pipe[-1] / p1
+        scaling = f" · pipeline {sc:.1f}× on {counts[-1]} threads ({sc / counts[-1] * 100:.0f}% of linear)"
+    subtitle = f"throughput at N threads vs {baseline_label}; tick = perfect linear scaling{scaling}"
+    return svg_doc(ink, height, "Thread scaling",
+                   subtitle, "".join(grid) + "".join(body) + legend, meta)
+
+
+def pretok_compare_md(model):
+    """Per-fixture 'classify + fsm vs a regex engine' table: the pre-tokenize split beating both onig
+    (C) and fancy-regex (pure Rust), WITH and WITHOUT SIMD. Rendered only for regex pre-tokenizers
+    (a reference is non-null). ns/byte, lower better. pipe-SIMD = the pre-tokenize stage (SIMD classify
+    + scalar fsm); pipe-scalar swaps in the scalar classifier (= pre-tokenize + (cls_scalar - cls_simd));
+    onig/fancy run the model's own pre-tokenizer regex(es)."""
+    engines = ("onig", "fancy", "pcre2", "logos")
+
+    def has_ref(r):
+        pv = r.get("pretok_vs_regex") or {}
+        return r.get("stage_ns_per_byte") and any(pv.get(k) is not None for k in engines)
+    rows = [r for r in model["results"] if has_ref(r)]
+    if not rows:
+        return []
+    cell = lambda v: fnum(v, "{:.1f}")  # noqa: E731 — "—" for null
+    def ratio(v, sp, cp):
+        return f"{v / sp:.1f}× / {v / cp:.1f}×" if (v is not None and sp > 0 and cp > 0) else "—"
+    cols = 4 + 2 * len(engines)  # cls×2 + pipe×2 + one abs + one ×vs per engine
+    md = ["", "**Pre-tokenize: `classify + fsm` vs regex engines** — ns/byte, lower better. The fsm is "
+          "the scalar jump-table in both pipe columns; **SIMD / scalar is the classify pass** (regex "
+          "pre-tokenizers have no SIMD fsm). `×vs` = engine ÷ our pipeline (SIMD / scalar classify); "
+          "`onig` & `pcre2` (JIT) are C, `fancy` is pure-Rust fancy-regex, `logos` is a compile-time DFA "
+          "lexer (approximate grammar; n/a for deepseek).", "",
+          "| Fixture | classify SIMD | classify scalar | pipe (SIMD cls + fsm) | pipe (scalar cls + fsm) | "
+          + " | ".join(engines) + " | " + " | ".join(f"×vs {e}" for e in engines) + " |",
+          "|---" + "|---:" * cols + "|"]
+    for r in sorted(rows, key=lambda r: (r["group"], r["fixture"])):
+        pv = r["pretok_vs_regex"]
+        simd_pipe = r["stage_ns_per_byte"]["pre_tokenize"]
+        scalar_pipe = simd_pipe + max(0.0, pv["cls_scalar"] - pv["cls_simd"])
+        md.append(
+            f"| {r['fixture']} | {fnum(pv['cls_simd'], '{:.2f}')} | {fnum(pv['cls_scalar'], '{:.2f}')} "
+            f"| {fnum(simd_pipe, '{:.2f}')} | {fnum(scalar_pipe, '{:.2f}')} "
+            + "".join(f"| {cell(pv.get(k))} " for k in engines)
+            + " ".join(f"| {ratio(pv.get(k), simd_pipe, scalar_pipe)}" for k in engines)
+            + " |")
+    return md
+
+
+def render_markdown(data, subtitle_base, meta, base, run_id, sizes,
+                    base_lookup=None, base_ref=None):
     """Overview charts inline; everything per-model — charts and the per-fixture
     table — inside one <details> block per model, so the PR description stays a
     single screen. No cross-model aggregate number anywhere: the models exercise
@@ -698,8 +847,12 @@ def render_markdown(data, subtitle_base, meta, base, run_id, sizes):
           f"**{len(benched)} / {len(models)} models supported** — PipelineTokenizer vs "
           f"`tokenizers` {baseline_label} (latest release) · {subtitle_base}", "",
           f"`{meta[0]}` · {meta[1]}", "",
-          picture(base, run_id, "overview", "Per-model encode throughput vs latest release", 860), "",
-          picture(base, run_id, "memory", "Per-model memory footprint", 860), ""]
+          picture(base, run_id, "overview", "Per-model encode throughput vs latest release", 860), ""]
+    if base_lookup:
+        md += [f"**vs base branch** (`{escape(base_ref or 'base')}`) — per-model geomean ×speedup of "
+               f"this PR's PipelineTokenizer against the base branch's; **regressions in red**.", "",
+               picture(base, run_id, "base-overview", "Per-model encode throughput vs base branch", 860), ""]
+    md += [picture(base, run_id, "memory", "Per-model memory footprint", 860), ""]
     if sizes:
         md += [picture(base, run_id, "binsize", "Minimal encode binary size", 860), ""]
 
@@ -717,6 +870,10 @@ def render_markdown(data, subtitle_base, meta, base, run_id, sizes):
         vals = model_speedups(m)
         summary = (f"×{geomean(vals):.2f} vs {baseline_label}" if vals
                    else f"{baseline_label} can't load — no comparison")
+        if base_lookup:
+            bvals = base_model_speedups(m, base_lookup)
+            if bvals:
+                summary += f" · ×{geomean(bvals):.2f} vs base"
         flag = " · ⚠ ids differ" if any(r["ids_match"] is False for r in m["results"]) else ""
         md += [f"<details><summary><b>{escape(m['model'])}</b> — {escape(desc)} · "
                f"{summary}{flag}</summary>", ""]
@@ -724,13 +881,18 @@ def render_markdown(data, subtitle_base, meta, base, run_id, sizes):
         if has_stages(m):
             md += [picture(base, run_id, f"{slug}-stages",
                            f"{m['model']} stage decomposition", 860), ""]
+        if has_threads(m):
+            md += [picture(base, run_id, f"{slug}-threads",
+                           f"{m['model']} thread scaling", 860), ""]
         md += [mem_line(m, baseline_label), ""]
         # Per-stage columns show each split's share of the pipeline's own encode time
         # with the ns/byte alongside — `share% (ns/B)` — so the split cost is readable
         # as text regardless of how slow the release baseline is.
-        md += [f"| Fixture | Group | {baseline_label} MB/s | Pipeline MB/s | Speedup "
-               "| added-token | normalize | pre-tokenize | model | Ids |",
-               "|---|---|---:|---:|---:|---:|---:|---:|---:|:--|"]
+        base_col = " Δ base |" if base_lookup else ""
+        base_sep = "---:|" if base_lookup else ""
+        md += [f"| Fixture | Group | {baseline_label} MB/s | Pipeline MB/s | Speedup |{base_col} "
+               "added-token | normalize | pre-tokenize | model | Ids |",
+               f"|---|---|---:|---:|---:|{base_sep}---:|---:|---:|---:|:--|"]
         for r in sorted(m["results"], key=lambda r: (r["group"], r["fixture"])):
             mb = r["mbps"]
             flags = []
@@ -742,11 +904,14 @@ def render_markdown(data, subtitle_base, meta, base, run_id, sizes):
             s = r.get("stage_ns_per_byte")
             stages = " ".join(f"| {stage_cell(s, k)}"
                               for k in ("added_split", "normalize", "pre_tokenize", "model"))
+            base_cell = (f"| {fnum(base_speedup(r, base_lookup, m['model']), '×{:.2f}')} "
+                         if base_lookup else "")
             md.append(
                 f"| {r['fixture']} | {r['group']} "
                 f"| {fnum(mb.get('baseline'))} | {fnum(mb.get('pipeline'))} "
                 f"| {fnum(speedup(r), '×{:.2f}')} "
-                f"{stages} | {ids} |")
+                f"{base_cell}{stages} | {ids} |")
+        md += pretok_compare_md(m)
         md += ["", "</details>", ""]
 
     # Unsupported / failed-to-load models: roadmap cards, collapsed — they're
@@ -775,6 +940,10 @@ def main():
     ap.add_argument("--run-id", default="local")
     ap.add_argument("--binary-sizes", default="",
                     help="JSON file {baseline, pipeline} of stripped binary bytes")
+    ap.add_argument("--base-bench", default="",
+                    help="base branch's cached fixture_bench JSON — enables the 'vs base branch' chart")
+    ap.add_argument("--base-ref", default="",
+                    help="label for the base branch baseline (e.g. short sha)")
     args = ap.parse_args()
 
     rev = args.revision
@@ -793,10 +962,31 @@ def main():
     sizes = json.loads(Path(args.binary_sizes).read_text()) if args.binary_sizes else None
     benched = [m for m in models if m["results"]]
     lo, hi = scale(benched)
+
+    # "vs base branch": join the PR results against the base branch's cached run by
+    # (model, fixture). base_lookup[(model, fixture)] = base pipeline MB/s.
+    base_lookup, base_speedups_of, blo, bhi = None, None, lo, hi
+    if args.base_bench and Path(args.base_bench).exists():
+        base_data = json.loads(Path(args.base_bench).read_text())
+        base_lookup = {(bm["model"], r["fixture"]): r["mbps"].get("pipeline")
+                       for bm in base_data["models"] for r in bm["results"]}
+        if any(base_lookup.values()):
+            base_speedups_of = lambda m: base_model_speedups(m, base_lookup)  # noqa: E731
+            blo, bhi = scale(benched, base_speedups_of)
+        else:
+            base_lookup = None
+
     out = Path(args.out_dir)
     for mode in ("light", "dark"):
         (out / f"pipeline_bench_overview_{mode}.svg").write_text(
             overview_svg(models, mode, args.subtitle, meta, lo, hi, baseline_label))
+        if base_lookup:
+            (out / f"pipeline_bench_base-overview_{mode}.svg").write_text(
+                overview_svg(models, mode, args.subtitle, meta, blo, bhi, baseline_label,
+                             speedups_of=base_speedups_of,
+                             title="PipelineTokenizer vs base branch — encode throughput",
+                             ref_label=(args.base_ref or "base branch"), mark_regressions=True,
+                             no_cmp_msg="not benched on the base branch"))
         (out / f"pipeline_bench_memory_{mode}.svg").write_text(
             memory_svg(models, mode, meta, baseline_label))
         if sizes:
@@ -811,9 +1001,13 @@ def main():
             if has_stages(m):
                 (out / f"pipeline_bench_{slug}-stages_{mode}.svg").write_text(
                     stage_chart_svg(m, mode, args.subtitle, meta, baseline_label))
+            if has_threads(m):
+                (out / f"pipeline_bench_{slug}-threads_{mode}.svg").write_text(
+                    threads_svg(m, mode, meta, baseline_label))
 
     (out / "pipeline_bench.md").write_text(
-        render_markdown(data, args.subtitle, meta, args.img_base, args.run_id, sizes))
+        render_markdown(data, args.subtitle, meta, args.img_base, args.run_id, sizes,
+                        base_lookup=base_lookup, base_ref=args.base_ref))
 
     # per-model geomeans only — a cross-model aggregate would average unrelated
     # execution modes (normalizer-heavy vs split-heavy vs model-bounded)
@@ -822,6 +1016,12 @@ def main():
         for m in benched if model_speedups(m))
     print(f"{len(benched)}/{len(models)} supported"
           + (f" · vs {baseline_label}: {per_model}" if per_model else ""))
+    if base_lookup:
+        vs_base = " · ".join(
+            f"{m['model']} x{geomean(base_speedups_of(m)):.3f}"
+            for m in benched if base_speedups_of(m))
+        print(f"vs base ({args.base_ref or 'base'}): {vs_base}" if vs_base
+              else "vs base: no overlapping fixtures")
 
 
 if __name__ == "__main__":
