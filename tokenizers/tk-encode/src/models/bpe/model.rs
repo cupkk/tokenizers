@@ -1,4 +1,5 @@
 use super::{super::OrderedVocabIter, Error, Pair, Word};
+
 use crate::bucket_vocab_store::BucketVocabStore;
 use crate::models::bpe::Merge;
 use crate::pipeline::{self, ModelScratch, PipelineToken};
